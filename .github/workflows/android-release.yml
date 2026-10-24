@@ -1,0 +1,107 @@
+name: Android Release APK
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-release-apk:
+    name: Android ARM64 Release APK
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装 Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: 缓存 Gradle 依赖与构建工具
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          cache-read-only: false
+
+      - name: 安装 Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: 安装 Android 平台与 NDK
+        shell: bash
+        run: |
+          sdkmanager "platforms;android-36" "build-tools;35.0.0" "ndk;27.2.12479018"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: 安装 Rust Android 目标
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: 缓存 Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装前端依赖
+        run: npm ci --no-audit --no-fund
+
+      - name: 准备 Android Release 签名
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -z "$ANDROID_KEYSTORE_BASE64" || -z "$ANDROID_KEYSTORE_PASSWORD" || -z "$ANDROID_KEY_ALIAS" || -z "$ANDROID_KEY_PASSWORD" ]]; then
+            echo "缺少 Android Release 签名 Secrets" >&2
+            exit 1
+          fi
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/coolapk-upload.jks"
+
+      - name: 构建签名 APK
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/coolapk-upload.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: npm run android:build -- --target aarch64 --apk --ci
+
+      - name: 校验并整理 Release APK
+        shell: bash
+        run: |
+          mkdir -p android-release
+          apk="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk"
+          test -f "$apk"
+
+          verification="$("$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --min-sdk-version 23 "$apk")"
+          printf '%s\n' "$verification"
+          grep -Fqx 'Verified using v1 scheme (JAR signing): true' <<< "$verification"
+          grep -Fqx 'Verified using v2 scheme (APK Signature Scheme v2): true' <<< "$verification"
+
+          expected_version="$(node -p 'require("./package.json").version')"
+          expected_code="$(node -p 'require("./src-tauri/tauri.conf.json").bundle.android.versionCode')"
+          badging="$("$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$apk")"
+          grep '^package:' <<< "$badging" | grep -F "versionName='$expected_version'" | grep -F "versionCode='$expected_code'"
+
+          cp "$apk" "android-release/coolapk-${GITHUB_REF_NAME//\//-}-android-arm64.apk"
+
+      - name: 上传 Release APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: android-arm64-release
+          path: android-release/*.apk
+          if-no-files-found: error
